@@ -499,6 +499,44 @@ pub trait Tool: Send + Sync {
     fn concurrency_mode(&self) -> ConcurrencyMode {
         ConcurrencyMode::Shared
     }
+
+    /// 权限 key — 权限规则匹配时使用的标识。
+    ///
+    /// 默认返回工具名称。某些工具可能细分权限：
+    /// 如 bash 工具根据子命令前缀返回 `"bash"` 或 `"bash:git"`。
+    fn permission_key(&self) -> &str {
+        &self.definition().name
+    }
+
+    /// 工具级权限检查 — 在规则引擎求值后、用户交互前调用。
+    ///
+    /// ## 用途
+    /// 工具实现可据此检查：
+    /// - 路径安全性（如禁止写入 `.git/`、`.katu/` 目录）
+    /// - 命令安全性（如禁止 `rm -rf /`）
+    /// - URL 白名单等
+    ///
+    /// ## 返回值
+    /// - `Passthrough` — 不做判断，交由规则引擎（**默认**）
+    /// - `Allow` — 工具认为此操作安全
+    /// - `Deny { message }` — 工具明确拒绝
+    /// - `Ask { message }` — 工具建议询问用户
+    ///
+    /// ## 与 validate 的区别
+    /// - `validate()` = 参数**格式**是否合法（类型检查）
+    /// - `check_permissions()` = 操作**是否被允许**（授权检查）
+    ///
+    /// ## 调用顺序
+    /// ```text
+    /// Hook(PreToolUse) → check_permissions() → 规则引擎 → 用户交互 → validate() → execute()
+    /// ```
+    fn check_permissions(
+        &self,
+        _args: &serde_json::Value,
+        _ctx: &ToolCallContext,
+    ) -> crate::permission::PermissionResult {
+        crate::permission::PermissionResult::Passthrough
+    }
 }
 
 // ===========================================================================

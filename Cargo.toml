@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/katu-core",
     "crates/katu-llm",
+    "crates/katu-agent",
     "crates/katu-provider-http",
     "crates/katu-provider-openai",
 ]
@@ -17,6 +18,7 @@ rust-version = "1.85"
 # 内部 crate
 katu-core = { path = "crates/katu-core" }
 katu-llm = { path = "crates/katu-llm" }
+katu-agent = { path = "crates/katu-agent" }
 katu-provider-http = { path = "crates/katu-provider-http" }
 katu-provider-openai = { path = "crates/katu-provider-openai" }
 
@@ -47,6 +49,9 @@ eventsource-stream = "0.2"
 
 # 日志
 tracing = "0.1"
+
+# 有序 HashMap
+indexmap = { version = "2", features = ["serde"] }
 
 # 测试
 tokio-test = "0.4"

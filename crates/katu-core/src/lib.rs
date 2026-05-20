@@ -15,6 +15,7 @@
 //! - `tool` — 工具类型与执行契约 (Tool, ToolDefinition, ToolOutput, ToolCallContext...)
 //! - `agent` — Agent 定义数据模型 (AgentDefinition, AgentRole, ToolFilter...)
 //! - `hook` — Hook 系统类型与执行契约 (Hook, HookEvent, HookInput, HookOutput, HookRegistry...)
+//! - `permission` — 权限系统类型与规则引擎 (PermissionRule, Ruleset, PermissionDecision, PermissionMode...)
 
 pub mod agent;
 pub mod agent_event;
@@ -24,6 +25,7 @@ pub mod event;
 pub mod generation;
 pub mod hook;
 pub mod message;
+pub mod permission;
 pub mod tool;
 pub mod types;
 pub mod usage;
