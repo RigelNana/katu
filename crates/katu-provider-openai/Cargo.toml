@@ -1,0 +1,23 @@
+[package]
+name = "katu-provider-openai"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "OpenAI Chat Completions provider adapter for the Katu LLM framework"
+
+[dependencies]
+katu-core = { workspace = true }
+katu-llm = { workspace = true }
+katu-provider-http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+async-stream = { workspace = true }
+futures-core = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }

@@ -1,0 +1,16 @@
+[package]
+name = "katu-llm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "LLM abstraction layer for the Katu AI Agent framework"
+
+[dependencies]
+katu-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+futures-core = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }

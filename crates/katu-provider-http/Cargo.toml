@@ -1,0 +1,21 @@
+[package]
+name = "katu-provider-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Shared HTTP/SSE transport layer for Katu LLM provider adapters"
+
+[dependencies]
+katu-core = { workspace = true }
+katu-llm = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+eventsource-stream = { workspace = true }
+tokio-stream = { workspace = true }
+futures-core = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
