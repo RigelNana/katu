@@ -14,15 +14,17 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.85"
+repository = "https://github.com/RigelNana/katu"
+homepage = "https://github.com/RigelNana/katu"
 
 [workspace.dependencies]
 # 内部 crate
-katu-core = { path = "crates/katu-core" }
-katu-llm = { path = "crates/katu-llm" }
-katu-agent = { path = "crates/katu-agent" }
-katu-provider-http = { path = "crates/katu-provider-http" }
-katu-provider-openai = { path = "crates/katu-provider-openai" }
-katu-tool = { path = "crates/katu-tool" }
+katu-core = { path = "crates/katu-core", version = "0.1.0" }
+katu-llm = { path = "crates/katu-llm", version = "0.1.0" }
+katu-agent = { path = "crates/katu-agent", version = "0.1.0" }
+katu-provider-http = { path = "crates/katu-provider-http", version = "0.1.0" }
+katu-provider-openai = { path = "crates/katu-provider-openai", version = "0.1.0" }
+katu-tool = { path = "crates/katu-tool", version = "0.1.0" }
 
 # 序列化
 serde = { version = "1", features = ["derive"] }
