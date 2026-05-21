@@ -29,3 +29,4 @@ indexmap = { version = "2", features = ["serde"] }
 tokio-test = { workspace = true }
 async-stream = { workspace = true }
 katu-provider-openai = { workspace = true }
+katu-tool = { workspace = true }

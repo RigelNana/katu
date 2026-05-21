@@ -312,9 +312,8 @@ impl Tool for BashTool {
             ));
         }
 
-        // 取消令牌
-        let cancel = tokio_util::sync::CancellationToken::new();
-        // TODO: 接入 ToolCallContext 的 CancellationToken
+        // 直接使用 ToolCallContext 的 CancellationToken（child token 实现层级取消）
+        let cancel = _ctx.cancellation.child_token();
 
         let result = self.executor.run(
             &command,

@@ -14,16 +14,13 @@
 //! - `ToolChoice` — 工具选择策略（auto / none / required / specific）
 //! - `Tool` — 工具执行 trait（definition + validate + execute + concurrency_mode）
 //! - `ToolCallContext` — 执行上下文（call_id + cancellation + extra）
-//! - `CancellationToken` — 协作式取消令牌
+//! - `CancellationToken` — 取消令牌（re-export `tokio_util::sync::CancellationToken`）
 //! - `ConcurrencyMode` — 并发调度标记
 //!
 //! ## 调用者
 //! - `katu-llm` — `LlmRequest` 持有 `Vec<ToolDefinition>` + `ToolChoice`
 //! - `katu-agent` (future) — Agent loop 通过 `Tool` trait 调用工具
 //! - `katu-core::event` — `StreamEvent::ToolResult` 可从 `ToolOutput` 构造
-
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -282,19 +279,20 @@ impl ToolChoice {
 
 
 // ===========================================================================
-// CancellationToken
+// CancellationToken (re-export)
 // ===========================================================================
 
-/// 协作式取消令牌。
+/// 取消令牌 — re-export `tokio_util::sync::CancellationToken`。
 ///
 /// Agent loop 在需要取消工具时调用 `cancel()`，
-/// 工具在长运行循环中周期性检查 `is_cancelled()` 并提前退出。
+/// 工具通过 `.cancelled().await` 异步等待，或 `is_cancelled()` 同步轮询。
 ///
-/// ## 设计选择
-/// - **轻量 AtomicBool** — katu-core 保持 runtime 无关，不依赖 tokio
-/// - **polling 模式** — 覆盖长循环检查场景；async 等待由 agent loop 的
-///   `tokio::select!` 实现
-/// - **Clone 共享** — Arc 内部共享，agent loop 和 tool 各持一端
+/// ## 核心 API
+/// - `CancellationToken::new()` — 创建
+/// - `.cancel()` — 触发取消
+/// - `.is_cancelled()` — 同步检查
+/// - `.cancelled().await` — 异步等待
+/// - `.child_token()` — 层级取消（Agent → Runner → Tool）
 ///
 /// # Examples
 ///
@@ -302,38 +300,13 @@ impl ToolChoice {
 /// use katu_core::CancellationToken;
 ///
 /// let token = CancellationToken::new();
-/// let token2 = token.clone();
+/// let child = token.child_token();
 ///
 /// assert!(!token.is_cancelled());
-/// token2.cancel();
-/// assert!(token.is_cancelled());
+/// token.cancel();
+/// assert!(child.is_cancelled());
 /// ```
-/// !TODO
-#[derive(Debug, Clone)]
-pub struct CancellationToken(Arc<AtomicBool>);
-
-impl CancellationToken {
-    /// 创建未取消的令牌。
-    pub fn new() -> Self {
-        Self(Arc::new(AtomicBool::new(false)))
-    }
-
-    /// 触发取消。
-    pub fn cancel(&self) {
-        self.0.store(true, Ordering::Release);
-    }
-
-    /// 检查是否已取消。
-    pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
-    }
-}
-
-impl Default for CancellationToken {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+pub use tokio_util::sync::CancellationToken;
 
 // ===========================================================================
 // ConcurrencyMode
@@ -589,6 +562,7 @@ pub trait Tool: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use serde_json::json;
 
     // -- ToolDefinition --
@@ -784,9 +758,12 @@ mod tests {
     }
 
     #[test]
-    fn test_cancellation_token_default() {
-        let token = CancellationToken::default();
-        assert!(!token.is_cancelled());
+    fn test_cancellation_token_child() {
+        let parent = CancellationToken::new();
+        let child = parent.child_token();
+        assert!(!child.is_cancelled());
+        parent.cancel();
+        assert!(child.is_cancelled());
     }
 
     // -- ConcurrencyMode --

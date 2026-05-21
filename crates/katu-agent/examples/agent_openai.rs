@@ -4,7 +4,7 @@
 //!
 //! ## 流程
 //! ```text
-//! 1. 定义工具 (get_time, read_file)
+//! 1. 定义工具 (get_time, read_file, bash)
 //! 2. 创建 AgentDefinition + ModelRef + OpenAiProvider
 //! 3. 通过 InstanceBuilder 构建 AgentInstance
 //! 4. 创建 DefaultCompactor
@@ -40,6 +40,7 @@ use katu_llm::model::{ModelLimits, ModelRef};
 use katu_agent::compaction::DefaultCompactor;
 use katu_agent::instance::{InstanceBuilder, RunConfig};
 use katu_agent::runner::Runner;
+use katu_tool::shell::BashTool;
 
 // ===========================================================================
 // 工具定义
@@ -281,6 +282,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(GetTimeTool::new()),
         Arc::new(ReadFileTool::new()),
+        Arc::new(BashTool::new()),
     ];
 
     // ── 5. 事件 channel ─────────────────────────────────────

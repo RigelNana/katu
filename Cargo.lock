@@ -786,6 +786,7 @@ dependencies = [
  "katu-core",
  "katu-llm",
  "katu-provider-openai",
+ "katu-tool",
  "rand",
  "serde",
  "serde_json",
@@ -807,6 +808,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-test",
+ "tokio-util",
  "uuid",
 ]
 

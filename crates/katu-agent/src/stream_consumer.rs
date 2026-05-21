@@ -123,7 +123,7 @@ impl StreamConsumer {
             // tokio::select! 允许在等待下一事件时响应取消
             let item = tokio::select! {
                 biased;
-                _ = Self::wait_for_cancel(cancel) => {
+                _ = cancel.cancelled() => {
                     debug!("stream_consumer: cancelled during await");
                     return state.into_cancelled_result();
                 }
@@ -157,17 +157,6 @@ impl StreamConsumer {
             .ok_or(StreamConsumerError::UnexpectedEnd)
     }
 
-    /// 等待取消令牌触发的 future。
-    ///
-    /// 通过短间隔轮询实现（CancellationToken 基于 AtomicBool，无 async notify）。
-    async fn wait_for_cancel(token: &CancellationToken) {
-        loop {
-            if token.is_cancelled() {
-                return;
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-        }
-    }
 }
 
 // ===========================================================================
