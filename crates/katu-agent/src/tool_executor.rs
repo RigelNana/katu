@@ -5,6 +5,7 @@
 //! 集成 Hook + Permission 权限管线，实时发射 `AgentEvent`。
 //!
 //! ## 设计
+//! - **依赖持有** — `ToolExecutor` 持有执行所需的全部引用，方法签名简洁
 //! - **Partition + JoinSet** — 按 `ConcurrencyMode` 分批，Shared 并发、Exclusive 串行
 //! - **权限管线** — Hook(PreToolUse) → Tool::check_permissions → Ruleset → 决策
 //! - **取消传播** — 共享 `CancellationToken`，取消后未执行的工具产出 "cancelled" 假结果
@@ -26,6 +27,8 @@ use katu_core::permission::{PermissionResult, Ruleset};
 use katu_core::tool::{ConcurrencyMode, ToolCallContext, ToolOutput};
 use katu_core::types::{MessageId, ToolCallId};
 use katu_core::{CancellationToken, Tool};
+
+use crate::event_sender::{AgentEventSenderExt, ChannelClosedError};
 
 // ===========================================================================
 // Public Types
@@ -63,7 +66,7 @@ pub struct ToolBatchResult {
 pub enum ToolExecutorError {
     /// 事件 channel 已关闭。
     #[error("event channel closed")]
-    ChannelClosed,
+    ChannelClosed(#[from] ChannelClosedError),
 }
 
 /// 模块级 Result 别名。
@@ -73,28 +76,41 @@ pub type Result<T, E = ToolExecutorError> = std::result::Result<T, E>;
 // ToolExecutor
 // ===========================================================================
 
-/// 工具执行器 — 批量执行 assistant message 中的工具调用。
-pub struct ToolExecutor;
+/// 工具执行器 — 持有执行依赖，批量执行 assistant message 中的工具调用。
+pub struct ToolExecutor<'a> {
+    tools: &'a [Arc<dyn Tool>],
+    hooks: &'a HookRegistry,
+    ruleset: &'a Ruleset,
+    event_tx: &'a mpsc::UnboundedSender<AgentEvent>,
+    cancel: &'a CancellationToken,
+    config: &'a ToolExecutorConfig,
+}
 
-impl ToolExecutor {
+impl<'a> ToolExecutor<'a> {
+    /// 构造执行器。
+    pub fn new(
+        tools: &'a [Arc<dyn Tool>],
+        hooks: &'a HookRegistry,
+        ruleset: &'a Ruleset,
+        event_tx: &'a mpsc::UnboundedSender<AgentEvent>,
+        cancel: &'a CancellationToken,
+        config: &'a ToolExecutorConfig,
+    ) -> Self {
+        Self {
+            tools,
+            hooks,
+            ruleset,
+            event_tx,
+            cancel,
+            config,
+        }
+    }
+
     /// 执行 assistant message 中的所有工具调用。
     ///
-    /// # 流程
-    /// 1. 提取所有 `ToolCall` blocks
-    /// 2. 按 `ConcurrencyMode` 分批 (Partition)
-    /// 3. Shared batch → 并发执行（受 `max_concurrency` 限制）
-    /// 4. Exclusive batch → 串行执行
-    /// 5. 每个工具经过: Hook(PreToolUse) → validate → execute → Hook(PostToolUse)
-    pub async fn execute_batch(
-        assistant_message: &AssistantMessage,
-        tools: &[Arc<dyn Tool>],
-        hooks: &HookRegistry,
-        ruleset: &Ruleset,
-        event_tx: &mpsc::UnboundedSender<AgentEvent>,
-        cancel: &CancellationToken,
-        config: &ToolExecutorConfig,
-    ) -> Result<ToolBatchResult> {
-        let tool_calls = Self::extract_tool_calls(assistant_message);
+    /// 流程：extract → partition → concurrent/serial execution → collect
+    pub async fn execute_batch(&self, msg: &AssistantMessage) -> Result<ToolBatchResult> {
+        let tool_calls = Self::extract_tool_calls(msg);
         if tool_calls.is_empty() {
             return Ok(ToolBatchResult {
                 tool_results: Vec::new(),
@@ -102,30 +118,26 @@ impl ToolExecutor {
             });
         }
 
-        let batches = Self::partition_by_concurrency(&tool_calls, tools);
+        let batches = self.partition_by_concurrency(&tool_calls);
         let mut results: Vec<Option<ToolResultMessage>> = vec![None; tool_calls.len()];
         let mut interrupted = false;
 
         for batch in &batches {
-            if cancel.is_cancelled() {
+            if self.cancel.is_cancelled() {
                 interrupted = true;
                 break;
             }
 
             if batch.is_concurrent {
-                Self::execute_concurrent_batch(
-                    &batch.entries, tools, hooks, ruleset,
-                    event_tx, cancel, config, &mut results,
-                ).await?;
+                self.execute_concurrent_batch(&batch.entries, &mut results)
+                    .await?;
             } else {
                 for entry in &batch.entries {
-                    if cancel.is_cancelled() {
+                    if self.cancel.is_cancelled() {
                         interrupted = true;
                         break;
                     }
-                    let result = Self::execute_single_tool(
-                        entry, tools, hooks, ruleset, event_tx, cancel, config,
-                    ).await?;
+                    let result = self.execute_single_tool(entry).await?;
                     results[entry.original_index] = Some(result);
                 }
             }
@@ -135,7 +147,7 @@ impl ToolExecutor {
         for (i, slot) in results.iter_mut().enumerate() {
             if slot.is_none() {
                 let tc = &tool_calls[i];
-                Self::send(event_tx, AgentEvent::ToolFailed {
+                self.event_tx.emit(AgentEvent::ToolFailed {
                     call_id: tc.call_id.clone(),
                     tool_name: tc.name.clone(),
                     error: "Tool execution was cancelled".into(),
@@ -184,14 +196,18 @@ enum PreToolResult {
 // Private Implementation
 // ===========================================================================
 
-impl ToolExecutor {
+impl ToolExecutor<'_> {
     // ─── Extraction & Partitioning ───────────────────────────────────────────
 
     fn extract_tool_calls(msg: &AssistantMessage) -> Vec<ExtractedToolCall> {
         msg.content
             .iter()
             .filter_map(|block| match block {
-                AssistantBlock::ToolCall { id, name, arguments } => Some(ExtractedToolCall {
+                AssistantBlock::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                } => Some(ExtractedToolCall {
                     call_id: id.clone(),
                     name: name.clone(),
                     arguments: arguments.clone(),
@@ -201,14 +217,12 @@ impl ToolExecutor {
             .collect()
     }
 
-    fn partition_by_concurrency(
-        tool_calls: &[ExtractedToolCall],
-        tools: &[Arc<dyn Tool>],
-    ) -> Vec<ToolBatch> {
+    fn partition_by_concurrency(&self, tool_calls: &[ExtractedToolCall]) -> Vec<ToolBatch> {
         let mut batches: Vec<ToolBatch> = Vec::new();
 
         for (i, tc) in tool_calls.iter().enumerate() {
-            let mode = Self::find_tool(tools, &tc.name)
+            let mode = self
+                .find_tool(&tc.name)
                 .map(|t| t.concurrency_mode())
                 .unwrap_or(ConcurrencyMode::Shared);
 
@@ -237,23 +251,18 @@ impl ToolExecutor {
         batches
     }
 
-    fn find_tool<'a>(tools: &'a [Arc<dyn Tool>], name: &str) -> Option<&'a Arc<dyn Tool>> {
-        tools.iter().find(|t| t.definition().name == name)
+    fn find_tool(&self, name: &str) -> Option<&Arc<dyn Tool>> {
+        self.tools.iter().find(|t| t.definition().name == name)
     }
 
     // ─── Batch Execution ─────────────────────────────────────────────────────
 
     async fn execute_concurrent_batch(
+        &self,
         entries: &[BatchEntry],
-        tools: &[Arc<dyn Tool>],
-        hooks: &HookRegistry,
-        ruleset: &Ruleset,
-        event_tx: &mpsc::UnboundedSender<AgentEvent>,
-        cancel: &CancellationToken,
-        config: &ToolExecutorConfig,
         results: &mut [Option<ToolResultMessage>],
     ) -> Result<()> {
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(config.max_concurrency));
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(self.config.max_concurrency));
         let mut handles = Vec::with_capacity(entries.len());
 
         for entry in entries {
@@ -262,26 +271,29 @@ impl ToolExecutor {
             let name = entry.name.clone();
             let arguments = entry.arguments.clone();
             let original_index = entry.original_index;
-            let tool = Self::find_tool(tools, &name).cloned();
-            let cancel = cancel.clone();
-            let extra = config.extra.clone();
-            let event_tx = event_tx.clone();
+            let tool = self.find_tool(&name).cloned();
+            let cancel = self.cancel.clone();
+            let extra = self.config.extra.clone();
+            let event_tx = self.event_tx.clone();
 
             // Hook + permission 检查在 spawn 前执行（HookRegistry 不是 Send）
-            let pre_result = Self::run_pre_tool_pipeline(
-                &call_id, &name, &arguments, tool.as_ref(), hooks, ruleset,
-            ).await;
+            let pre_result = self
+                .run_pre_tool_pipeline(&call_id, &name, &arguments, tool.as_ref())
+                .await;
 
             let handle = tokio::spawn(async move {
                 let _permit = sem.acquire().await.expect("semaphore closed");
 
                 if cancel.is_cancelled() {
-                    return (original_index, ToolExecutor::make_cancelled_result(&call_id, &name));
+                    return (
+                        original_index,
+                        ToolExecutor::make_cancelled_result(&call_id, &name),
+                    );
                 }
 
                 let result = match pre_result {
                     PreToolResult::Denied { message } => {
-                        let _ = event_tx.send(AgentEvent::ToolFailed {
+                        event_tx.emit_lossy(AgentEvent::ToolFailed {
                             call_id: call_id.clone(),
                             tool_name: name.clone(),
                             error: message.clone(),
@@ -291,9 +303,15 @@ impl ToolExecutor {
                     }
                     PreToolResult::Proceed { effective_args } => {
                         ToolExecutor::execute_tool_inner(
-                            &call_id, &name, effective_args,
-                            tool.as_ref(), &cancel, &extra, &event_tx,
-                        ).await
+                            &call_id,
+                            &name,
+                            effective_args,
+                            tool.as_ref(),
+                            &cancel,
+                            &extra,
+                            &event_tx,
+                        )
+                        .await
                     }
                 };
 
@@ -317,25 +335,16 @@ impl ToolExecutor {
         Ok(())
     }
 
-    async fn execute_single_tool(
-        entry: &BatchEntry,
-        tools: &[Arc<dyn Tool>],
-        hooks: &HookRegistry,
-        ruleset: &Ruleset,
-        event_tx: &mpsc::UnboundedSender<AgentEvent>,
-        cancel: &CancellationToken,
-        config: &ToolExecutorConfig,
-    ) -> Result<ToolResultMessage> {
-        let tool = Self::find_tool(tools, &entry.name).cloned();
+    async fn execute_single_tool(&self, entry: &BatchEntry) -> Result<ToolResultMessage> {
+        let tool = self.find_tool(&entry.name).cloned();
 
-        let pre_result = Self::run_pre_tool_pipeline(
-            &entry.call_id, &entry.name, &entry.arguments,
-            tool.as_ref(), hooks, ruleset,
-        ).await;
+        let pre_result = self
+            .run_pre_tool_pipeline(&entry.call_id, &entry.name, &entry.arguments, tool.as_ref())
+            .await;
 
         let result = match pre_result {
             PreToolResult::Denied { message } => {
-                Self::send(event_tx, AgentEvent::ToolFailed {
+                self.event_tx.emit(AgentEvent::ToolFailed {
                     call_id: entry.call_id.clone(),
                     tool_name: entry.name.clone(),
                     error: message.clone(),
@@ -345,9 +354,15 @@ impl ToolExecutor {
             }
             PreToolResult::Proceed { effective_args } => {
                 Self::execute_tool_inner(
-                    &entry.call_id, &entry.name, effective_args,
-                    tool.as_ref(), cancel, &config.extra, event_tx,
-                ).await
+                    &entry.call_id,
+                    &entry.name,
+                    effective_args,
+                    tool.as_ref(),
+                    self.cancel,
+                    &self.config.extra,
+                    self.event_tx,
+                )
+                .await
             }
         };
 
@@ -357,12 +372,11 @@ impl ToolExecutor {
     // ─── Pre-Tool Pipeline ───────────────────────────────────────────────────
 
     async fn run_pre_tool_pipeline(
+        &self,
         call_id: &ToolCallId,
         tool_name: &str,
         arguments: &serde_json::Value,
         tool: Option<&Arc<dyn Tool>>,
-        hooks: &HookRegistry,
-        ruleset: &Ruleset,
     ) -> PreToolResult {
         let mut effective_args = arguments.clone();
 
@@ -373,7 +387,7 @@ impl ToolExecutor {
             call_id: call_id.clone(),
         };
 
-        let matching = hooks.matching(&hook_input);
+        let matching = self.hooks.matching(&hook_input);
         if !matching.is_empty() {
             let mut aggregated = AggregatedHookOutput::default();
             for registered in &matching {
@@ -383,7 +397,9 @@ impl ToolExecutor {
 
             if aggregated.is_denied() {
                 let reason = aggregated
-                    .blocking_errors.first().cloned()
+                    .blocking_errors
+                    .first()
+                    .cloned()
                     .unwrap_or_else(|| "Denied by hook".into());
                 return PreToolResult::Denied { message: reason };
             }
@@ -402,7 +418,10 @@ impl ToolExecutor {
                     return PreToolResult::Denied { message };
                 }
                 PermissionResult::Ask { message } => {
-                    debug!("tool_executor: tool {} requests user confirmation: {}", tool_name, message);
+                    debug!(
+                        "tool_executor: tool {} requests user confirmation: {}",
+                        tool_name, message
+                    );
                     return PreToolResult::Denied {
                         message: format!("User confirmation required: {message}"),
                     };
@@ -412,12 +431,28 @@ impl ToolExecutor {
         }
 
         // 3. Ruleset 规则引擎
-        let permission_key = tool
-            .map(|t| t.permission_key().to_string())
-            .unwrap_or_else(|| tool_name.to_string());
-        let content = effective_args.to_string();
+        //
+        // 优先使用工具提供的 permission_request()（细粒度 key + pattern），
+        // 回退到 permission_key() + args.to_string() 的默认逻辑。
+        let ctx = ToolCallContext::new(call_id.clone());
+        let (permission_key, content) = if let Some(req) =
+            tool.and_then(|t| t.permission_request(&effective_args, &ctx))
+        {
+            let key = req.permission;
+            let pat = req
+                .patterns
+                .first()
+                .cloned()
+                .unwrap_or_else(|| effective_args.to_string());
+            (key, pat)
+        } else {
+            let key = tool
+                .map(|t| t.permission_key().to_string())
+                .unwrap_or_else(|| tool_name.to_string());
+            (key, effective_args.to_string())
+        };
 
-        if let Some(behavior) = ruleset.evaluate(&permission_key, &content) {
+        if let Some(behavior) = self.ruleset.evaluate(&permission_key, &content) {
             if behavior.is_deny() {
                 return PreToolResult::Denied {
                     message: format!("Denied by permission rule for '{permission_key}'"),
@@ -442,7 +477,7 @@ impl ToolExecutor {
         let Some(tool) = tool else {
             let error_msg = format!("Tool not found: {tool_name}");
             warn!("tool_executor: {error_msg}");
-            let _ = event_tx.send(AgentEvent::ToolFailed {
+            event_tx.emit_lossy(AgentEvent::ToolFailed {
                 call_id: call_id.clone(),
                 tool_name: tool_name.to_string(),
                 error: error_msg.clone(),
@@ -451,7 +486,7 @@ impl ToolExecutor {
             return Self::make_error_result(call_id, tool_name, &error_msg);
         };
 
-        let _ = event_tx.send(AgentEvent::ToolCalled {
+        event_tx.emit_lossy(AgentEvent::ToolCalled {
             call_id: call_id.clone(),
             tool_name: tool_name.to_string(),
             arguments: arguments.clone(),
@@ -464,7 +499,7 @@ impl ToolExecutor {
         // Validate
         if let Err(e) = tool.validate(&arguments, &ctx).await {
             let error_msg = format!("Validation failed: {e}");
-            let _ = event_tx.send(AgentEvent::ToolFailed {
+            event_tx.emit_lossy(AgentEvent::ToolFailed {
                 call_id: call_id.clone(),
                 tool_name: tool_name.to_string(),
                 error: error_msg.clone(),
@@ -477,14 +512,14 @@ impl ToolExecutor {
         match tool.execute(arguments, &ctx).await {
             Ok(output) => {
                 if output.is_error {
-                    let _ = event_tx.send(AgentEvent::ToolFailed {
+                    event_tx.emit_lossy(AgentEvent::ToolFailed {
                         call_id: call_id.clone(),
                         tool_name: tool_name.to_string(),
                         error: output.content.clone(),
                         is_retryable: false,
                     });
                 } else {
-                    let _ = event_tx.send(AgentEvent::ToolSucceeded {
+                    event_tx.emit_lossy(AgentEvent::ToolSucceeded {
                         call_id: call_id.clone(),
                         tool_name: tool_name.to_string(),
                         output: output.clone(),
@@ -495,7 +530,7 @@ impl ToolExecutor {
             Err(e) => {
                 let error_msg = e.to_string();
                 let is_retryable = e.retryable();
-                let _ = event_tx.send(AgentEvent::ToolFailed {
+                event_tx.emit_lossy(AgentEvent::ToolFailed {
                     call_id: call_id.clone(),
                     tool_name: tool_name.to_string(),
                     error: error_msg.clone(),
@@ -508,12 +543,18 @@ impl ToolExecutor {
 
     // ─── Result Constructors ─────────────────────────────────────────────────
 
-    fn make_result(call_id: &ToolCallId, tool_name: &str, output: &ToolOutput) -> ToolResultMessage {
+    fn make_result(
+        call_id: &ToolCallId,
+        tool_name: &str,
+        output: &ToolOutput,
+    ) -> ToolResultMessage {
         ToolResultMessage {
             id: MessageId::new(),
             tool_call_id: call_id.clone(),
             tool_name: tool_name.to_string(),
-            content: vec![ContentBlock::Text { text: output.content.clone() }],
+            content: vec![ContentBlock::Text {
+                text: output.content.clone(),
+            }],
             is_error: output.is_error,
             timestamp: Utc::now(),
         }
@@ -524,7 +565,9 @@ impl ToolExecutor {
             id: MessageId::new(),
             tool_call_id: call_id.clone(),
             tool_name: tool_name.to_string(),
-            content: vec![ContentBlock::Text { text: error.to_string() }],
+            content: vec![ContentBlock::Text {
+                text: error.to_string(),
+            }],
             is_error: true,
             timestamp: Utc::now(),
         }
@@ -534,17 +577,12 @@ impl ToolExecutor {
         Self::make_error_result(call_id, tool_name, "Tool execution was cancelled")
     }
 
-    fn make_denied_result(call_id: &ToolCallId, tool_name: &str, message: &str) -> ToolResultMessage {
+    fn make_denied_result(
+        call_id: &ToolCallId,
+        tool_name: &str,
+        message: &str,
+    ) -> ToolResultMessage {
         Self::make_error_result(call_id, tool_name, &format!("Permission denied: {message}"))
-    }
-
-    // ─── Helpers ─────────────────────────────────────────────────────────────
-
-    fn send(
-        tx: &mpsc::UnboundedSender<AgentEvent>,
-        event: AgentEvent,
-    ) -> Result<()> {
-        tx.send(event).map_err(|_| ToolExecutorError::ChannelClosed)
     }
 }
 
@@ -565,50 +603,80 @@ mod tests {
 
     struct EchoTool;
     static ECHO_DEF: std::sync::LazyLock<ToolDefinition> = std::sync::LazyLock::new(|| {
-        ToolDefinition::new("echo", "Echo input", serde_json::json!({
-            "type": "object",
-            "properties": { "text": { "type": "string" } },
-            "required": ["text"]
-        }))
+        ToolDefinition::new(
+            "echo",
+            "Echo input",
+            serde_json::json!({
+                "type": "object",
+                "properties": { "text": { "type": "string" } },
+                "required": ["text"]
+            }),
+        )
     });
 
     #[async_trait]
     impl Tool for EchoTool {
-        fn definition(&self) -> &ToolDefinition { &ECHO_DEF }
-        async fn execute(&self, args: serde_json::Value, _ctx: &ToolCallContext) -> katu_core::Result<ToolOutput> {
+        fn definition(&self) -> &ToolDefinition {
+            &ECHO_DEF
+        }
+        async fn execute(
+            &self,
+            args: serde_json::Value,
+            _ctx: &ToolCallContext,
+        ) -> katu_core::Result<ToolOutput> {
             Ok(ToolOutput::success(args["text"].as_str().unwrap_or("")))
         }
     }
 
     struct FailTool;
-    static FAIL_DEF: std::sync::LazyLock<ToolDefinition> = std::sync::LazyLock::new(|| {
-        ToolDefinition::no_params("fail", "Always fails")
-    });
+    static FAIL_DEF: std::sync::LazyLock<ToolDefinition> =
+        std::sync::LazyLock::new(|| ToolDefinition::no_params("fail", "Always fails"));
 
     #[async_trait]
     impl Tool for FailTool {
-        fn definition(&self) -> &ToolDefinition { &FAIL_DEF }
-        async fn execute(&self, _args: serde_json::Value, _ctx: &ToolCallContext) -> katu_core::Result<ToolOutput> {
+        fn definition(&self) -> &ToolDefinition {
+            &FAIL_DEF
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            _ctx: &ToolCallContext,
+        ) -> katu_core::Result<ToolOutput> {
             Ok(ToolOutput::error("something went wrong"))
         }
     }
 
     struct ExclusiveWriteTool;
     static WRITE_DEF: std::sync::LazyLock<ToolDefinition> = std::sync::LazyLock::new(|| {
-        ToolDefinition::new("write_file", "Write file", serde_json::json!({
-            "type": "object",
-            "properties": { "path": { "type": "string" }, "content": { "type": "string" } },
-            "required": ["path", "content"]
-        }))
+        ToolDefinition::new(
+            "write_file",
+            "Write file",
+            serde_json::json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" }, "content": { "type": "string" } },
+                "required": ["path", "content"]
+            }),
+        )
     });
 
     #[async_trait]
     impl Tool for ExclusiveWriteTool {
-        fn definition(&self) -> &ToolDefinition { &WRITE_DEF }
-        async fn execute(&self, args: serde_json::Value, _ctx: &ToolCallContext) -> katu_core::Result<ToolOutput> {
-            Ok(ToolOutput::success(format!("Written to {}", args["path"].as_str().unwrap_or("?"))))
+        fn definition(&self) -> &ToolDefinition {
+            &WRITE_DEF
         }
-        fn concurrency_mode(&self) -> ConcurrencyMode { ConcurrencyMode::Exclusive }
+        async fn execute(
+            &self,
+            args: serde_json::Value,
+            _ctx: &ToolCallContext,
+        ) -> katu_core::Result<ToolOutput> {
+            Ok(ToolOutput::success(format!(
+                "Written to {}",
+                args["path"].as_str().unwrap_or("?")
+            )))
+        }
+        fn concurrency_mode(&self) -> ConcurrencyMode {
+            ConcurrencyMode::Exclusive
+        }
     }
 
     // ── 测试 Hook ──
@@ -617,8 +685,12 @@ mod tests {
 
     #[async_trait]
     impl Hook for DenyHook {
-        fn name(&self) -> &str { "deny_hook" }
-        fn events(&self) -> &[HookEvent] { &[HookEvent::PreToolUse] }
+        fn name(&self) -> &str {
+            "deny_hook"
+        }
+        fn events(&self) -> &[HookEvent] {
+            &[HookEvent::PreToolUse]
+        }
         async fn on_event(&self, _input: &katu_core::hook::HookInput) -> HookOutput {
             HookOutput::deny("blocked by test hook")
         }
@@ -628,14 +700,37 @@ mod tests {
 
     fn make_assistant_msg(blocks: Vec<AssistantBlock>) -> AssistantMessage {
         AssistantMessage {
-            id: MessageId::new(), content: blocks,
-            model: "test".into(), provider: "test".into(),
-            finish_reason: FinishReason::ToolCalls, usage: None, timestamp: Utc::now(),
+            id: MessageId::new(),
+            content: blocks,
+            model: "test".into(),
+            provider: "test".into(),
+            finish_reason: FinishReason::ToolCalls,
+            usage: None,
+            timestamp: Utc::now(),
         }
     }
 
     fn tc(id: &str, name: &str, args: serde_json::Value) -> AssistantBlock {
-        AssistantBlock::ToolCall { id: ToolCallId::new(id), name: name.into(), arguments: args }
+        AssistantBlock::ToolCall {
+            id: ToolCallId::new(id),
+            name: name.into(),
+            arguments: args,
+        }
+    }
+
+    /// 辅助：快速构造 ToolExecutor 并执行。
+    async fn run(
+        msg: &AssistantMessage,
+        tools: &[Arc<dyn Tool>],
+        hooks: &HookRegistry,
+        ruleset: &Ruleset,
+        tx: &mpsc::UnboundedSender<AgentEvent>,
+        cancel: &CancellationToken,
+    ) -> Result<ToolBatchResult> {
+        let config = ToolExecutorConfig::default();
+        ToolExecutor::new(tools, hooks, ruleset, tx, cancel, &config)
+            .execute_batch(msg)
+            .await
     }
 
     // ── 测试用例 ──
@@ -646,18 +741,35 @@ mod tests {
         let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(EchoTool)];
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        let result = ToolExecutor::execute_batch(
-            &msg, &tools, &HookRegistry::new(), &Ruleset::new(), &tx, &CancellationToken::new(), &ToolExecutorConfig::default(),
-        ).await.unwrap();
+        let result = run(
+            &msg,
+            &tools,
+            &HookRegistry::new(),
+            &Ruleset::new(),
+            &tx,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(result.tool_results.len(), 1);
         assert!(!result.interrupted);
         assert!(!result.tool_results[0].is_error);
 
         let mut events = Vec::new();
-        while let Ok(e) = rx.try_recv() { events.push(e); }
-        assert!(events.iter().any(|e| matches!(e, AgentEvent::ToolCalled { tool_name, .. } if tool_name == "echo")));
-        assert!(events.iter().any(|e| matches!(e, AgentEvent::ToolSucceeded { .. })));
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+        assert!(
+            events.iter().any(
+                |e| matches!(e, AgentEvent::ToolCalled { tool_name, .. } if tool_name == "echo")
+            )
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolSucceeded { .. }))
+        );
     }
 
     #[tokio::test]
@@ -666,9 +778,16 @@ mod tests {
         let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(EchoTool)];
         let (tx, _rx) = mpsc::unbounded_channel();
 
-        let result = ToolExecutor::execute_batch(
-            &msg, &tools, &HookRegistry::new(), &Ruleset::new(), &tx, &CancellationToken::new(), &ToolExecutorConfig::default(),
-        ).await.unwrap();
+        let result = run(
+            &msg,
+            &tools,
+            &HookRegistry::new(),
+            &Ruleset::new(),
+            &tx,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(result.tool_results.len(), 1);
         assert!(result.tool_results[0].is_error);
@@ -680,9 +799,16 @@ mod tests {
         let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(FailTool)];
         let (tx, _rx) = mpsc::unbounded_channel();
 
-        let result = ToolExecutor::execute_batch(
-            &msg, &tools, &HookRegistry::new(), &Ruleset::new(), &tx, &CancellationToken::new(), &ToolExecutorConfig::default(),
-        ).await.unwrap();
+        let result = run(
+            &msg,
+            &tools,
+            &HookRegistry::new(),
+            &Ruleset::new(),
+            &tx,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
 
         assert!(result.tool_results[0].is_error);
     }
@@ -697,9 +823,16 @@ mod tests {
         let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(EchoTool)];
         let (tx, _rx) = mpsc::unbounded_channel();
 
-        let result = ToolExecutor::execute_batch(
-            &msg, &tools, &HookRegistry::new(), &Ruleset::new(), &tx, &CancellationToken::new(), &ToolExecutorConfig::default(),
-        ).await.unwrap();
+        let result = run(
+            &msg,
+            &tools,
+            &HookRegistry::new(),
+            &Ruleset::new(),
+            &tx,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(result.tool_results.len(), 3);
         assert!(!result.interrupted);
@@ -712,15 +845,26 @@ mod tests {
     async fn test_exclusive_serial() {
         let msg = make_assistant_msg(vec![
             tc("c1", "echo", serde_json::json!({"text": "a"})),
-            tc("c2", "write_file", serde_json::json!({"path": "a.rs", "content": "fn main(){}"})),
+            tc(
+                "c2",
+                "write_file",
+                serde_json::json!({"path": "a.rs", "content": "fn main(){}"}),
+            ),
             tc("c3", "echo", serde_json::json!({"text": "b"})),
         ]);
         let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(EchoTool), Arc::new(ExclusiveWriteTool)];
         let (tx, _rx) = mpsc::unbounded_channel();
 
-        let result = ToolExecutor::execute_batch(
-            &msg, &tools, &HookRegistry::new(), &Ruleset::new(), &tx, &CancellationToken::new(), &ToolExecutorConfig::default(),
-        ).await.unwrap();
+        let result = run(
+            &msg,
+            &tools,
+            &HookRegistry::new(),
+            &Ruleset::new(),
+            &tx,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(result.tool_results.len(), 3);
         assert!(!result.interrupted);
@@ -740,9 +884,16 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
 
-        let result = ToolExecutor::execute_batch(
-            &msg, &tools, &HookRegistry::new(), &Ruleset::new(), &tx, &cancel, &ToolExecutorConfig::default(),
-        ).await.unwrap();
+        let result = run(
+            &msg,
+            &tools,
+            &HookRegistry::new(),
+            &Ruleset::new(),
+            &tx,
+            &cancel,
+        )
+        .await
+        .unwrap();
 
         assert!(result.interrupted);
         assert!(result.tool_results.iter().all(|r| r.is_error));
@@ -753,12 +904,23 @@ mod tests {
         let msg = make_assistant_msg(vec![tc("c1", "echo", serde_json::json!({"text": "hello"}))]);
         let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(EchoTool)];
         let mut ruleset = Ruleset::new();
-        ruleset.add(PermissionRule::deny(katu_core::permission::RuleSource::Policy, "echo", "*"));
+        ruleset.add(PermissionRule::deny(
+            katu_core::permission::RuleSource::Policy,
+            "echo",
+            "*",
+        ));
         let (tx, _rx) = mpsc::unbounded_channel();
 
-        let result = ToolExecutor::execute_batch(
-            &msg, &tools, &HookRegistry::new(), &ruleset, &tx, &CancellationToken::new(), &ToolExecutorConfig::default(),
-        ).await.unwrap();
+        let result = run(
+            &msg,
+            &tools,
+            &HookRegistry::new(),
+            &ruleset,
+            &tx,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
 
         assert!(result.tool_results[0].is_error);
     }
@@ -771,22 +933,38 @@ mod tests {
         hooks.register(Arc::new(DenyHook), HookSource::Programmatic, 0);
         let (tx, _rx) = mpsc::unbounded_channel();
 
-        let result = ToolExecutor::execute_batch(
-            &msg, &tools, &hooks, &Ruleset::new(), &tx, &CancellationToken::new(), &ToolExecutorConfig::default(),
-        ).await.unwrap();
+        let result = run(
+            &msg,
+            &tools,
+            &hooks,
+            &Ruleset::new(),
+            &tx,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
 
         assert!(result.tool_results[0].is_error);
     }
 
     #[tokio::test]
     async fn test_empty_tool_calls() {
-        let msg = make_assistant_msg(vec![AssistantBlock::Text { text: "No tools".into() }]);
+        let msg = make_assistant_msg(vec![AssistantBlock::Text {
+            text: "No tools".into(),
+        }]);
         let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(EchoTool)];
         let (tx, _rx) = mpsc::unbounded_channel();
 
-        let result = ToolExecutor::execute_batch(
-            &msg, &tools, &HookRegistry::new(), &Ruleset::new(), &tx, &CancellationToken::new(), &ToolExecutorConfig::default(),
-        ).await.unwrap();
+        let result = run(
+            &msg,
+            &tools,
+            &HookRegistry::new(),
+            &Ruleset::new(),
+            &tx,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
 
         assert!(result.tool_results.is_empty());
         assert!(!result.interrupted);

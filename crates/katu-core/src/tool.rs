@@ -434,6 +434,7 @@ impl ToolCallContext {
 /// - `validate()` — "参数合法吗"（可选的补充校验，默认通过）
 /// - `execute()` — "执行动作"（核心业务逻辑）
 /// - `concurrency_mode()` — "我的调度约束"（给 agent loop 的调度提示）
+/// - `permission_request()` — "细粒度权限"（动态构建权限请求，覆盖默认逻辑）
 ///
 /// ## 返回值约定
 /// - `Ok(ToolOutput { is_error: false })` — 工具成功
@@ -536,6 +537,48 @@ pub trait Tool: Send + Sync {
         _ctx: &ToolCallContext,
     ) -> crate::permission::PermissionResult {
         crate::permission::PermissionResult::Passthrough
+    }
+
+    /// 构建细粒度权限请求 — 工具可据此定制 permission key 和 pattern。
+    ///
+    /// 默认返回 `None` — 框架使用 `permission_key()` + `args.to_string()` 的默认逻辑。
+    ///
+    /// ## 用途
+    /// 需要细粒度权限控制的工具（如 bash）可覆盖此方法，提供：
+    /// - 更精确的 permission key（如 `"bash:git"` 而非 `"bash"`）
+    /// - 有意义的 pattern（如 `"git push origin main"` 而非序列化后的 JSON）
+    /// - always-allow 模式（如 `"git push *"`）
+    /// - UI 展示用的元数据
+    ///
+    /// ## 与 permission_key() 的关系
+    /// - `permission_key()` 返回固定的 `&str`，适合简单工具
+    /// - `permission_request()` 返回动态构造的 `PermissionRequest`，适合需要
+    ///   根据参数内容变化 key 和 pattern 的复杂工具
+    /// - 如果两者都实现，`permission_request()` 优先
+    ///
+    /// ## 调用时机
+    /// 在 `check_permissions()` 返回 `Passthrough` 后、Ruleset 求值前调用。
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// fn permission_request(
+    ///     &self,
+    ///     args: &serde_json::Value,
+    ///     _ctx: &ToolCallContext,
+    /// ) -> Option<crate::permission::PermissionRequest> {
+    ///     let command = args["command"].as_str()?;
+    ///     Some(crate::permission::PermissionRequest::new("bash:git", command)
+    ///         .with_tool_name("bash")
+    ///         .with_always_allow(vec!["git push *"]))
+    /// }
+    /// ```
+    fn permission_request(
+        &self,
+        _args: &serde_json::Value,
+        _ctx: &ToolCallContext,
+    ) -> Option<crate::permission::PermissionRequest> {
+        None
     }
 }
 

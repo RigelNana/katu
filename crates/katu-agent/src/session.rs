@@ -25,10 +25,12 @@ use chrono::{DateTime, Utc};
 
 use katu_core::agent::AgentDefinition;
 use katu_core::compaction::{CompactionConfig, TokenBudgetState};
-use katu_core::message::{AssistantMessage, Message, ToolResultMessage, UserContent};
+use katu_core::message::{AssistantMessage, ContentBlock, Message, ToolResultMessage, UserContent};
 use katu_core::types::{ModelId, Role, SessionId};
 use katu_core::usage::Usage;
 use katu_core::CancellationToken;
+
+use crate::compaction::CompactionState;
 
 // ===========================================================================
 // SessionStatus
@@ -128,6 +130,9 @@ pub struct Session {
     /// 上下文压缩配置。
     compaction_config: CompactionConfig,
 
+    /// 压缩运行时状态（熔断器、防重复）。
+    compaction_state: CompactionState,
+
     /// 创建时间。
     created_at: DateTime<Utc>,
 
@@ -155,6 +160,7 @@ impl Session {
             context_tokens: 0,
             context_window: 0,
             compaction_config: CompactionConfig::default(),
+            compaction_state: CompactionState::new(),
             created_at: now,
             updated_at: now,
         }
@@ -285,6 +291,27 @@ impl Session {
     pub fn message_slice(&self) -> &[Message] {
         &self.messages
     }
+
+    /// 截断指定索引处的 ToolResult 消息内容。
+    ///
+    /// 用于 Prune 阶段截断旧工具输出，释放 token 空间。
+    /// 如果索引处不是 ToolResult 消息，静默忽略。
+    pub fn truncate_tool_result(&mut self, index: usize, truncation_msg: &str, max_chars: usize) {
+        if let Some(Message::ToolResult(tr)) = self.messages.get_mut(index) {
+            let total_chars: usize = tr.content.iter().map(|b| match b {
+                ContentBlock::Text { text } => text.len(),
+                ContentBlock::Image { .. } => 0,
+            }).sum();
+
+            if total_chars > max_chars {
+                // 替换为截断消息
+                tr.content = vec![ContentBlock::Text {
+                    text: truncation_msg.to_string(),
+                }];
+                self.touch();
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -315,6 +342,8 @@ impl Session {
         self.status = SessionStatus::Running;
         // 重置取消令牌（前一次可能已取消）
         self.cancel_token = CancellationToken::new();
+        // 重置步数 — 每轮独立计数，避免多轮累积触发 MaxSteps
+        self.step_count = 0;
         self.touch();
     }
 
@@ -447,6 +476,16 @@ impl Session {
     /// 是否应触发自动压缩。
     pub fn should_compact(&self) -> bool {
         self.compaction_config.auto_enabled && self.budget_state().should_auto_compact()
+    }
+
+    /// 压缩运行时状态引用。
+    pub fn compaction_state(&self) -> &CompactionState {
+        &self.compaction_state
+    }
+
+    /// 压缩运行时状态可变引用。
+    pub fn compaction_state_mut(&mut self) -> &mut CompactionState {
+        &mut self.compaction_state
     }
 }
 
@@ -713,6 +752,24 @@ mod tests {
             assert_eq!(step, i);
         }
         assert!(session.is_over_step_limit());
+    }
+
+    #[test]
+    fn test_step_count_resets_on_begin_run() {
+        let mut session = test_session();
+        session.begin_run();
+
+        // 第一轮：跑 3 步
+        session.increment_step();
+        session.increment_step();
+        session.increment_step();
+        assert_eq!(session.step_count(), 3);
+        session.end_run();
+
+        // 第二轮：步数重置
+        session.begin_run();
+        assert_eq!(session.step_count(), 0);
+        assert!(!session.is_over_step_limit());
     }
 
     #[test]

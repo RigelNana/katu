@@ -6,6 +6,7 @@ members = [
     "crates/katu-agent",
     "crates/katu-provider-http",
     "crates/katu-provider-openai",
+    "crates/katu-tool",
 ]
 
 [workspace.package]
@@ -21,6 +22,7 @@ katu-llm = { path = "crates/katu-llm" }
 katu-agent = { path = "crates/katu-agent" }
 katu-provider-http = { path = "crates/katu-provider-http" }
 katu-provider-openai = { path = "crates/katu-provider-openai" }
+katu-tool = { path = "crates/katu-tool" }
 
 # 序列化
 serde = { version = "1", features = ["derive"] }
@@ -50,8 +52,15 @@ eventsource-stream = "0.2"
 # 日志
 tracing = "0.1"
 
+# 随机
+rand = "0.9"
+
 # 有序 HashMap
 indexmap = { version = "2", features = ["serde"] }
+
+# 进程管理
+tokio-util = { version = "0.7", features = ["rt"] }
+libc = "0.2"
 
 # 测试
 tokio-test = "0.4"

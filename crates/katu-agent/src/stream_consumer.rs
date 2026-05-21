@@ -27,6 +27,8 @@ use katu_core::types::{FinishReason, MessageId, ToolCallId};
 use katu_core::usage::Usage;
 use katu_core::CancellationToken;
 
+use crate::event_sender::{AgentEventSenderExt, ChannelClosedError};
+
 // ===========================================================================
 // Public Types
 // ===========================================================================
@@ -59,7 +61,7 @@ pub enum StreamConsumerError {
 
     /// 事件发送失败（接收端已关闭）
     #[error("event channel closed")]
-    ChannelClosed,
+    ChannelClosed(#[from] ChannelClosedError),
 }
 
 /// 模块级 Result 别名。
@@ -335,7 +337,7 @@ impl StreamState {
                     content_index,
                     text: String::new(),
                 });
-                Self::send(tx, AgentEvent::TextStarted { content_index })?;
+                tx.emit(AgentEvent::TextStarted { content_index })?;
             }
             StreamEvent::TextDelta {
                 content_index,
@@ -344,13 +346,7 @@ impl StreamState {
                 if let Some(acc) = &mut self.text_buf {
                     acc.text.push_str(&delta);
                 }
-                Self::send(
-                    tx,
-                    AgentEvent::TextDelta {
-                        content_index,
-                        delta,
-                    },
-                )?;
+                tx.emit(AgentEvent::TextDelta { content_index, delta })?;
             }
             StreamEvent::TextEnd { content_index } => {
                 let text = if let Some(acc) = self.text_buf.take() {
@@ -362,7 +358,7 @@ impl StreamState {
                 } else {
                     String::new()
                 };
-                Self::send(tx, AgentEvent::TextEnded { content_index, text })?;
+                tx.emit(AgentEvent::TextEnded { content_index, text })?;
             }
 
             // ─── Reasoning 流 ───
@@ -371,7 +367,7 @@ impl StreamState {
                     content_index,
                     text: String::new(),
                 });
-                Self::send(tx, AgentEvent::ReasoningStarted { content_index })?;
+                tx.emit(AgentEvent::ReasoningStarted { content_index })?;
             }
             StreamEvent::ReasoningDelta {
                 content_index,
@@ -380,13 +376,7 @@ impl StreamState {
                 if let Some(acc) = &mut self.reasoning_buf {
                     acc.text.push_str(&delta);
                 }
-                Self::send(
-                    tx,
-                    AgentEvent::ReasoningDelta {
-                        content_index,
-                        delta,
-                    },
-                )?;
+                tx.emit(AgentEvent::ReasoningDelta { content_index, delta })?;
             }
             StreamEvent::ReasoningEnd { content_index } => {
                 let text = if let Some(acc) = self.reasoning_buf.take() {
@@ -401,10 +391,7 @@ impl StreamState {
                 } else {
                     String::new()
                 };
-                Self::send(
-                    tx,
-                    AgentEvent::ReasoningEnded { content_index, text },
-                )?;
+                tx.emit(AgentEvent::ReasoningEnded { content_index, text })?;
             }
             StreamEvent::ToolCallStart {
                 content_index,
@@ -419,13 +406,7 @@ impl StreamState {
                         content_index,
                     },
                 );
-                Self::send(
-                    tx,
-                    AgentEvent::ToolInputStarted {
-                        call_id: id,
-                        tool_name: name,
-                    },
-                )?;
+                tx.emit(AgentEvent::ToolInputStarted { call_id: id, tool_name: name })?;
             }
             StreamEvent::ToolCallDelta {
                 content_index,
@@ -439,13 +420,10 @@ impl StreamState {
                     .find(|(_, acc)| acc.content_index == content_index)
                 {
                     acc.arguments_buf.push_str(&delta);
-                    Self::send(
-                        tx,
-                        AgentEvent::ToolInputDelta {
-                            call_id: call_id.clone(),
-                            delta,
-                        },
-                    )?;
+                    tx.emit(AgentEvent::ToolInputDelta {
+                        call_id: call_id.clone(),
+                        delta,
+                    })?;
                 }
             }
             StreamEvent::ToolCallEnd { content_index } => {
@@ -468,13 +446,7 @@ impl StreamState {
                             arguments: arguments.clone(),
                         });
 
-                        Self::send(
-                            tx,
-                            AgentEvent::ToolInputEnded {
-                                call_id,
-                                arguments,
-                            },
-                        )?;
+                        tx.emit(AgentEvent::ToolInputEnded { call_id, arguments })?;
                     }
                 }
             }
@@ -505,13 +477,6 @@ impl StreamState {
         Ok(false)
     }
 
-    /// 通过 channel 发送 AgentEvent。
-    fn send(
-        tx: &mpsc::UnboundedSender<AgentEvent>,
-        event: AgentEvent,
-    ) -> Result<()> {
-        tx.send(event).map_err(|_| StreamConsumerError::ChannelClosed)
-    }
 }
 
 // ===========================================================================
