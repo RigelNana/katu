@@ -7,7 +7,7 @@
 //! - **ShellExecutor** — 无状态执行器，持有配置（shell 路径、环境变量）
 //! - **ShellResult** — 执行结果（exit code、输出快照、是否超时/取消）
 //! - 使用 `tokio::process::Command` 异步 spawn
-//! - 通过 `CancellationToken`（tokio_util）或 `AbortSignal` 实现外部取消
+//! - 通过 `CancellationToken` 实现外部取消
 //! - 输出通过 `OutputCollector` 流式收集，自动截断
 
 use std::collections::HashMap;
@@ -17,8 +17,15 @@ use std::time::Duration;
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
 
+use katu_core::CancellationToken;
+
 use super::env::NonInteractiveEnv;
 use super::output::{OutputCollector, OutputSnapshot};
+
+/// 输出回调 — 每收到一行输出时调用。
+///
+/// 参数为一行文本（包含换行符）。
+pub type OutputCallback = Box<dyn Fn(&str) + Send + Sync>;
 
 // ===========================================================================
 // ShellResult
@@ -61,7 +68,7 @@ impl ShellResult {
 ///
 /// ```no_run
 /// use katu_tool::shell::{ShellExecutor, ShellResult};
-/// use tokio_util::sync::CancellationToken;
+/// use katu_core::CancellationToken;
 ///
 /// # async fn example() {
 /// let executor = ShellExecutor::new();
@@ -143,9 +150,9 @@ impl ShellExecutor {
         command: &str,
         cwd: impl AsRef<Path>,
         timeout: Duration,
-        cancel: tokio_util::sync::CancellationToken,
+        cancel: CancellationToken,
     ) -> ShellResult {
-        self.run_with_env(command, cwd, timeout, cancel, None).await
+        self.run_inner(command, cwd, timeout, cancel, None, None).await
     }
 
     /// 执行命令（带额外环境变量）。
@@ -154,8 +161,36 @@ impl ShellExecutor {
         command: &str,
         cwd: impl AsRef<Path>,
         timeout: Duration,
-        cancel: tokio_util::sync::CancellationToken,
+        cancel: CancellationToken,
         extra_env: Option<&HashMap<String, String>>,
+    ) -> ShellResult {
+        self.run_inner(command, cwd, timeout, cancel, extra_env, None).await
+    }
+
+    /// 执行命令（带流式输出回调）。
+    ///
+    /// `on_output` 在每收到一行 stdout/stderr 时同步调用，
+    /// 适用于 UI 增量显示。
+    pub async fn run_with_callback(
+        &self,
+        command: &str,
+        cwd: impl AsRef<Path>,
+        timeout: Duration,
+        cancel: CancellationToken,
+        on_output: OutputCallback,
+    ) -> ShellResult {
+        self.run_inner(command, cwd, timeout, cancel, None, Some(on_output)).await
+    }
+
+    /// 内部执行入口。
+    async fn run_inner(
+        &self,
+        command: &str,
+        cwd: impl AsRef<Path>,
+        timeout: Duration,
+        cancel: CancellationToken,
+        extra_env: Option<&HashMap<String, String>>,
+        on_output: Option<OutputCallback>,
     ) -> ShellResult {
         let collector = OutputCollector::new(self.output_head_bytes, self.output_tail_bytes);
 
@@ -200,27 +235,38 @@ impl ShellExecutor {
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
 
+        // 将回调包装为 Arc 以便在多个 task 中共享
+        let callback: Option<std::sync::Arc<OutputCallback>> = on_output.map(std::sync::Arc::new);
+
         // 异步读取 stdout + stderr
         let collector_for_stdout = collector.clone();
+        let cb_stdout = callback.clone();
         let stdout_task = tokio::spawn(async move {
             if let Some(stdout) = stdout {
                 let reader = tokio::io::BufReader::new(stdout);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    collector_for_stdout.push(&line);
-                    collector_for_stdout.push("\n");
+                    let chunk = format!("{line}\n");
+                    collector_for_stdout.push(&chunk);
+                    if let Some(ref cb) = cb_stdout {
+                        cb(&chunk);
+                    }
                 }
             }
         });
 
         let collector_for_stderr = collector.clone();
+        let cb_stderr = callback;
         let stderr_task = tokio::spawn(async move {
             if let Some(stderr) = stderr {
                 let reader = tokio::io::BufReader::new(stderr);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    collector_for_stderr.push(&line);
-                    collector_for_stderr.push("\n");
+                    let chunk = format!("{line}\n");
+                    collector_for_stderr.push(&chunk);
+                    if let Some(ref cb) = cb_stderr {
+                        cb(&chunk);
+                    }
                 }
             }
         });
@@ -310,7 +356,7 @@ impl ShellExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio_util::sync::CancellationToken;
+    use katu_core::CancellationToken;
 
     #[tokio::test]
     async fn test_simple_echo() {

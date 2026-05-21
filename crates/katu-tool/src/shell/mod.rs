@@ -34,7 +34,7 @@ mod tool;
 
 pub use command::{CommandDescriptor, CommandEntry, RiskLevel};
 pub use config::BashToolConfig;
-pub use executor::{ShellExecutor, ShellResult};
+pub use executor::{OutputCallback, ShellExecutor, ShellResult};
 pub use output::OutputCollector;
 pub use policy::{HardDenyChecker, ReadOnlyChecker};
 pub use tool::BashTool;
