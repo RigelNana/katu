@@ -19,7 +19,7 @@ homepage = "https://github.com/RigelNana/katu"
 
 [workspace.dependencies]
 # 内部 crate
-katu-core = { path = "crates/katu-core", version = "0.1.0" }
+katu-core = { path = "crates/katu-core", version = "0.1.1" }
 katu-llm = { path = "crates/katu-llm", version = "0.1.0" }
 katu-agent = { path = "crates/katu-agent", version = "0.1.0" }
 katu-provider-http = { path = "crates/katu-provider-http", version = "0.1.0" }
